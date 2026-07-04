@@ -139,6 +139,29 @@ parse_args() {
 
 # --- 4. PATHS & DERIVED STATE ---
 
+get_user_home_dir() {
+  local home="${HOME:-}"
+  if [ -z "$home" ] || [ ! -d "$home" ]; then
+    home=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)
+  fi
+  if [ -z "$home" ] || [ ! -d "$home" ]; then
+    home="/root"
+  fi
+  echo "$home"
+}
+
+list_proxy_dir_candidates() {
+  local seen="" home candidate
+  for home in "$(get_user_home_dir)" "/root" "/home"; do
+    [ -z "$home" ] && continue
+    candidate="$home/proxyserver"
+    if [[ " $seen " != *" $candidate "* ]]; then
+      seen="$seen $candidate"
+      echo "$candidate"
+    fi
+  done
+}
+
 apply_export_paths_from_base() {
   backconnect_proxies_file="$backconnect_proxies_base.list"
   backconnect_proxies_txt_file="$backconnect_proxies_base.txt"
@@ -146,33 +169,79 @@ apply_export_paths_from_base() {
   backconnect_proxies_csv_file="$backconnect_proxies_base.csv"
 }
 
-init_paths() {
-  bash_location="$(which bash)"
-  cd ~ || exit 1
-  user_home_dir="$(pwd)"
-  proxy_dir="$user_home_dir/proxyserver"
+set_paths_for_proxy_dir() {
+  proxy_dir="$1"
+  user_home_dir="${proxy_dir%/proxyserver}"
   proxyserver_config_path="$proxy_dir/3proxy/3proxy.cfg"
   proxyserver_info_file="$proxy_dir/running_server.info"
   random_ipv6_list_file="$proxy_dir/ipv6.list"
   ndppd_routing_file="$proxy_dir/ndppd.routed"
   random_users_list_file="$proxy_dir/random_users.list"
-
-  if [[ "$backconnect_proxies_file" == "default" ]]; then
-    backconnect_proxies_base="$proxy_dir/backconnect_proxies"
-  else
-    case "$backconnect_proxies_file" in
-      *.list|*.txt|*.json|*.csv) backconnect_proxies_base="${backconnect_proxies_file%.*}" ;;
-      *) backconnect_proxies_base="$backconnect_proxies_file" ;;
-    esac
-  fi
-  apply_export_paths_from_base
-
   server_state_file="$proxy_dir/server.state"
   lock_file="$proxy_dir/.lock"
   startup_script_path="$proxy_dir/proxy-startup.sh"
   cron_script_path="$proxy_dir/proxy-server.cron"
+
+  if [[ "${backconnect_proxies_file:-default}" == "default" ]]; then
+    backconnect_proxies_base="$proxy_dir/backconnect_proxies"
+    apply_export_paths_from_base
+  fi
+}
+
+init_paths() {
+  bash_location="$(which bash)"
+  set_paths_for_proxy_dir "$(get_user_home_dir)/proxyserver"
+
+  if [[ "$backconnect_proxies_file" != "default" ]]; then
+    case "$backconnect_proxies_file" in
+      *.list|*.txt|*.json|*.csv) backconnect_proxies_base="${backconnect_proxies_file%.*}" ;;
+      *) backconnect_proxies_base="$backconnect_proxies_file" ;;
+    esac
+    apply_export_paths_from_base
+  fi
+
   last_port=""
   credentials=""
+}
+
+proxy_dir_has_install_marker() {
+  local dir=$1
+  [ -f "$dir/server.state" ] || \
+  [ -f "$dir/proxy-startup.sh" ] || \
+  [ -f "$dir/3proxy/bin/3proxy" ] || \
+  [ -f "$dir/3proxy/3proxy.cfg" ] || \
+  [ -f "$dir/running_server.info" ]
+}
+
+discover_existing_install() {
+  local dir
+  for dir in $(list_proxy_dir_candidates); do
+    if proxy_dir_has_install_marker "$dir"; then
+      set_paths_for_proxy_dir "$dir"
+      if [[ "${backconnect_proxies_file:-default}" != "default" ]]; then
+        case "$backconnect_proxies_file" in
+          *.list|*.txt|*.json|*.csv) backconnect_proxies_base="${backconnect_proxies_file%.*}" ;;
+          *) backconnect_proxies_base="$backconnect_proxies_file" ;;
+        esac
+        apply_export_paths_from_base
+      fi
+      return 0
+    fi
+  done
+  return 1
+}
+
+list_install_blockers() {
+  local dir blockers=""
+  for dir in $(list_proxy_dir_candidates); do
+    if proxy_dir_has_install_marker "$dir"; then
+      blockers="${blockers}  - $dir\n"
+    fi
+  done
+  if pgrep -f '[p]roxyserver/3proxy' >/dev/null 2>&1; then
+    blockers="${blockers}  - running 3proxy process (proxyserver/3proxy)\n"
+  fi
+  printf '%b' "$blockers"
 }
 
 refresh_derived_values() {
@@ -363,8 +432,10 @@ prepare_append() {
 # --- 7. SYSTEM CHECKS ---
 
 is_proxyserver_installed() {
-  # Ignore lock-only proxy_dir (e.g. after acquire_lock on a fresh install).
-  if [ -f "$server_state_file" ] || [ -f "$startup_script_path" ] || [ -f "$proxy_dir/3proxy/bin/3proxy" ]; then
+  if discover_existing_install; then
+    return 0
+  fi
+  if pgrep -f '[p]roxyserver/3proxy' >/dev/null 2>&1; then
     return 0
   fi
   return 1
@@ -395,6 +466,29 @@ delete_file_if_exists() {
   if test -f "$1"; then
     rm "$1"
   fi
+}
+
+delete_export_files_for_current_paths() {
+  delete_file_if_exists "$backconnect_proxies_file"
+  delete_file_if_exists "$backconnect_proxies_txt_file"
+  delete_file_if_exists "$backconnect_proxies_json_file"
+  delete_file_if_exists "$backconnect_proxies_csv_file"
+}
+
+cleanup_proxy_dir() {
+  local dir=$1
+  set_paths_for_proxy_dir "$dir"
+
+  if [ -f "$server_state_file" ]; then
+    # shellcheck disable=SC1090
+    source "$server_state_file"
+    apply_export_paths_from_base
+  fi
+
+  remove_ipv6_addresses_from_iface
+  close_ufw_backconnect_ports
+  delete_export_files_for_current_paths
+  rm -rf "$dir"
 }
 
 create_random_string() {
@@ -660,11 +754,20 @@ add_to_cron() {
 }
 
 remove_from_cron() {
-  crontab -l | grep -v "$startup_script_path" > "$cron_script_path"
-  crontab "$cron_script_path"
+  local filtered_cron
+  if ! crontab -l >/dev/null 2>&1; then
+    return
+  fi
+
+  filtered_cron=$(crontab -l 2>/dev/null | grep -v 'proxy-startup.sh' || true)
+  if [ -n "$filtered_cron" ]; then
+    printf '%s\n' "$filtered_cron" | crontab -
+  else
+    crontab -r 2>/dev/null || true
+  fi
   systemctl restart cron
 
-  if crontab -l | grep -q "$startup_script_path"; then
+  if crontab -l 2>/dev/null | grep -q 'proxy-startup.sh'; then
     log_err "Warning: cannot delete proxy script from crontab"
   else
     echo "Proxy script deleted from crontab successfully"
@@ -1118,28 +1221,38 @@ cmd_info() {
   exit 0
 }
 
+has_install_artifacts() {
+  local dir
+  for dir in $(list_proxy_dir_candidates); do
+    if proxy_dir_has_install_marker "$dir" || [ -d "$dir" ]; then
+      return 0
+    fi
+  done
+  if pgrep -f '[p]roxyserver/3proxy' >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
 cmd_uninstall() {
-  if ! is_proxyserver_installed && [ ! -d "$proxy_dir" ]; then
+  if ! has_install_artifacts; then
     log_err_and_exit "Proxy server is not installed"
   fi
 
+  set_paths_for_proxy_dir "$(get_user_home_dir)/proxyserver"
   acquire_lock
-
-  if [ -f "$server_state_file" ]; then
-    # shellcheck disable=SC1090
-    source "$server_state_file"
-    apply_export_paths_from_base
-  fi
 
   remove_from_cron
   kill_3proxy
-  remove_ipv6_addresses_from_iface
-  close_ufw_backconnect_ports
-  rm -rf "$proxy_dir"
-  delete_file_if_exists "$backconnect_proxies_file"
-  delete_file_if_exists "$backconnect_proxies_txt_file"
-  delete_file_if_exists "$backconnect_proxies_json_file"
-  delete_file_if_exists "$backconnect_proxies_csv_file"
+
+  local dir
+  for dir in $(list_proxy_dir_candidates); do
+    if [ -d "$dir" ] || proxy_dir_has_install_marker "$dir"; then
+      cleanup_proxy_dir "$dir"
+    fi
+  done
+
+  set_paths_for_proxy_dir "$(get_user_home_dir)/proxyserver"
   echo -e "\nIPv6 proxy server successfully uninstalled. If you want to reinstall, just run this script again."
   exit 0
 }
@@ -1153,17 +1266,26 @@ cmd_append() {
 
 guard_fresh_install_not_overwriting() {
   local local_existing_count="unknown"
+  local blockers
 
-  if is_proxyserver_installed; then
-    if [ -f "$server_state_file" ]; then
-      # shellcheck disable=SC1090
-      source "$server_state_file"
-      local_existing_count="$proxy_count"
-    elif [ -f "$backconnect_proxies_file" ]; then
-      local_existing_count=$(wc -l < "$backconnect_proxies_file" | tr -d ' ')
-    fi
-    log_err_and_exit "Error: proxy server already installed ($local_existing_count proxies). Use '--append -c <N>' to add more proxies without changing existing ones, or '--uninstall' to remove everything first."
+  if ! is_proxyserver_installed; then
+    return
   fi
+
+  discover_existing_install
+
+  if [ -f "$server_state_file" ]; then
+    # shellcheck disable=SC1090
+    source "$server_state_file"
+    local_existing_count="$proxy_count"
+  elif [ -f "$backconnect_proxies_file" ]; then
+    local_existing_count=$(wc -l < "$backconnect_proxies_file" | tr -d ' ')
+  fi
+
+  blockers=$(list_install_blockers)
+  log_err_and_exit "Error: proxy server already installed ($local_existing_count proxies) at $proxy_dir.
+Remaining install artifacts:
+${blockers}Use '--uninstall' to remove everything first, or '--append -c <N>' to add more proxies."
 }
 
 cmd_install() {
