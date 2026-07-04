@@ -8,16 +8,17 @@ fi;
 # Program help info for users
 function usage() { echo "Usage: $0 [-s | --subnet <16|32|48|64|80|96|112> proxy subnet (default 64)] 
                           [-c | --proxy-count <number> count of proxies] 
-                          [-u | --username <string> proxy auth username] 
-                          [-p | --password <string> proxy password]
-                          [--random <bool> generate random username/password for each IPv4 backconnect proxy instead of predefined (default false)] 
+                          [-u | --username <string> shared proxy auth username for all proxies]
+                          [-p | --password <string> shared proxy auth password for all proxies]
+                          [--random <bool> random 8-char alphanumeric username/password per proxy (default true)]
+                          [--no-auth <bool> disable proxy authentication]
                           [-t | --proxies-type <http|socks5> result proxies type (default http)]
                           [-r | --rotating-interval <0-59> rotating time of external proxies address in minutes (default 0, disabled)]
                           [--rotate-every-request <bool> use random external address for every request (--rotating-interval will be ignored)]
                           [--start-port <5000-65536> start port for backconnect ipv4 (default 30000)]
                           [-l | --localhost <bool> allow connections only for localhost (backconnect on 127.0.0.1)]
-                          [-f | --backconnect-proxies-file <string> path to file, in which backconnect proxies list will be written
-                                when proxies start working (default \`~/proxyserver/backconnect_proxies.list\`)]                                                     
+                          [-f | --backconnect-proxies-file <string> base path for exported proxy files (.list, .txt, .json, .csv)
+                                when proxies start working (default \`~/proxyserver/backconnect_proxies\`)]
                           [-m | --ipv6-mask <string> constant ipv6 address mask, to which the rotated part is added (or gateaway)
                                 use only if the gateway is different from the subnet address]
                           [-i | --interface <string> full name of ethernet interface, on which IPv6 subnet was allocated
@@ -31,7 +32,7 @@ function usage() { echo "Usage: $0 [-s | --subnet <16|32|48|64|80|96|112> proxy 
                           [--info <bool> print info about running proxy server]
                           " 1>&2; exit 1; }
 
-options=$(getopt -o lhs:c:u:p:t:r:m:f:i:b: --long help,rotate-every-request,localhost,random,uninstall,info,subnet:,proxy-count:,username:,password:,proxies-type:,rotating-interval:,ipv6-mask:,interface:,start-port:,backconnect-proxies-file:,backconnect-ip:,allowed-hosts:,denied-hosts: -- "$@")
+options=$(getopt -o lhs:c:u:p:t:r:m:f:i:b: --long help,rotate-every-request,localhost,random,no-auth,uninstall,info,subnet:,proxy-count:,username:,password:,proxies-type:,rotating-interval:,ipv6-mask:,interface:,start-port:,backconnect-proxies-file:,backconnect-ip:,allowed-hosts:,denied-hosts: -- "$@")
 
 # Throw error and chow help message if user don`t provide any arguments
 if [ $? != 0 ] ; then echo "Error: no arguments provided. Terminating..." >&2 ; usage ; fi;
@@ -45,7 +46,9 @@ proxies_type="http"
 start_port=30000
 rotating_interval=0
 use_localhost=false
-use_random_auth=false
+use_random_auth=true
+use_no_auth=false
+random_flag_set=false
 uninstall=false
 try_rotate_every_request=false
 rotate_every_request=false
@@ -63,13 +66,13 @@ while true; do
     -h | --help ) usage; shift ;;
     -s | --subnet ) subnet="$2"; shift 2 ;;
     -c | --proxy-count ) proxy_count="$2"; shift 2 ;;
-    -u | --username ) user="$2"; shift 2 ;;
-    -p | --password ) password="$2"; shift 2 ;;
+    -u | --username ) user="$2"; use_random_auth=false; shift 2 ;;
+    -p | --password ) password="$2"; use_random_auth=false; shift 2 ;;
     -t | --proxies-type ) proxies_type="$2"; shift 2 ;;
     -r | --rotating-interval ) rotating_interval="$2"; shift 2;;
     -m | --ipv6-mask ) subnet_mask="$2"; shift 2;;
     -b | --backconnect-ip ) backconnect_ipv4="$2"; shift 2;;
-    -f | --backconnect_proxies_file ) backconnect_proxies_file="$2"; shift 2;;
+    -f | --backconnect_proxies_file | --backconnect-proxies-file ) backconnect_proxies_file="$2"; shift 2;;
     -i | --interface ) interface_name="$2"; shift 2;;
     -l | --localhost ) use_localhost=true; shift ;;
     --allowed-hosts ) allowed_hosts="$2"; shift 2;;
@@ -77,7 +80,8 @@ while true; do
     --uninstall ) uninstall=true; shift ;;
     --info ) print_info=true; shift ;;
     --start-port ) start_port="$2"; shift 2;;
-    --random ) use_random_auth=true; shift ;;
+    --random ) use_random_auth=true; random_flag_set=true; shift ;;
+    --no-auth ) use_no_auth=true; use_random_auth=false; shift ;;
     --rotate-every-request ) try_rotate_every_request=true; shift ;;
     -- ) shift; break ;;
     * ) break ;;
@@ -104,7 +108,7 @@ function is_valid_ip(){
 }
 
 function is_auth_used(){
-  if [ -z $user ] && [ -z $password] && [ $use_random_auth = false ]; then false; return; else true; return; fi;
+  if [ -z "$user" ] && [ -z "$password" ] && [ $use_random_auth = false ]; then false; return; else true; return; fi;
 }
 
 function check_startup_parameters(){
@@ -114,12 +118,20 @@ function check_startup_parameters(){
     log_err_print_usage_and_exit "Error: Argument -c (proxy count) must be a positive integer number";
   fi;
 
-  if ([ -z $user ] || [ -z $password ]) && is_auth_used && [ $use_random_auth = false ]; then
+  if $use_no_auth && $random_flag_set; then
+    log_err_print_usage_and_exit "Error: don't use '--no-auth' together with '--random'";
+  fi;
+
+  if $use_no_auth && ([[ -n "$user" ]] || [[ -n "$password" ]]); then
+    log_err_print_usage_and_exit "Error: don't use '--no-auth' together with '--username' or '--password'";
+  fi;
+
+  if ([ -z "$user" ] || [ -z "$password" ]) && is_auth_used && [ $use_random_auth = false ]; then
     log_err_print_usage_and_exit "Error: user and password for proxy with auth is required (specify both '--username' and '--password' startup parameters)";
   fi;
 
-  if ([[ -n $user ]] || [[ -n $password ]]) && [ $use_random_auth = true ]; then
-    log_err_print_usage_and_exit "Error: don't provide user or password as arguments, if '--random' flag is set.";
+  if ([[ -n "$user" ]] || [[ -n "$password" ]]) && { [ $use_random_auth = true ] || $random_flag_set; }; then
+    log_err_print_usage_and_exit "Error: don't provide user or password as arguments, if '--random' flag is set (or leave defaults for random auth).";
   fi;
 
   if [ $proxies_type != "http" ] && [ $proxies_type != "socks5" ] ; then
@@ -171,8 +183,19 @@ random_ipv6_list_file="$proxy_dir/ipv6.list"
 ndppd_routing_file="$proxy_dir/ndppd.routed"
 # Path to file with proxy random usernames/password
 random_users_list_file="$proxy_dir/random_users.list"
-# Define correct path to file with backconnect proxies list, if it isn't defined by user
-if [[ $backconnect_proxies_file == "default" ]]; then backconnect_proxies_file="$proxy_dir/backconnect_proxies.list"; fi;
+# Base path for exported proxy files (.list, .txt, .json, .csv)
+if [[ $backconnect_proxies_file == "default" ]]; then
+  backconnect_proxies_base="$proxy_dir/backconnect_proxies";
+else
+  case "$backconnect_proxies_file" in
+    *.list|*.txt|*.json|*.csv) backconnect_proxies_base="${backconnect_proxies_file%.*}" ;;
+    *) backconnect_proxies_base="$backconnect_proxies_file" ;;
+  esac;
+fi;
+backconnect_proxies_file="$backconnect_proxies_base.list";
+backconnect_proxies_txt_file="$backconnect_proxies_base.txt";
+backconnect_proxies_json_file="$backconnect_proxies_base.json";
+backconnect_proxies_csv_file="$backconnect_proxies_base.csv";
 # Script on server startup (generate random ids and run proxy daemon)
 startup_script_path="$proxy_dir/proxy-startup.sh"
 # Cron config path (start proxy server after linux reboot and IPs rotations)
@@ -437,8 +460,11 @@ function remove_from_cron(){
 }
 
 function generate_random_users_if_needed(){
-  # No need to generate random usernames and passwords for proxies, if auth=none or one username/password for all proxies provided
-  if $use_random_auth; then return; fi;
+  # Generate random 8-char alphanumeric username/password per proxy only when random auth is enabled
+  if ! $use_random_auth; then
+    delete_file_if_exists $random_users_list_file;
+    return;
+  fi;
   delete_file_if_exists $random_users_list_file;
   
   for i in $(seq 1 $proxy_count); do 
@@ -528,9 +554,13 @@ function create_startup_script(){
 
   auth_part="auth iponly"
   if [ $use_auth -eq 0 ]; then
-    auth_part="
-      auth strong
-      users $user:CL:$password"
+    if [ $use_random_auth = true ]; then
+      auth_part="auth strong"
+    else
+      auth_part="
+        auth strong
+        users $user:CL:$password"
+    fi;
   fi;
   
   if [ -n "$denied_hosts" ]; then 
@@ -562,7 +592,7 @@ function create_startup_script(){
   count=0
   if [ "$proxies_type" = "http" ]; then proxy_startup_depending_on_type="proxy -6 -n -a"; else proxy_startup_depending_on_type="socks -6 -a"; fi;
   if [ $use_random_auth = true ]; then readarray -t proxy_random_credentials < $random_users_list_file; fi;
-  while [ "\$count" -le $proxy_count ]; do
+  while [ "\$count" -lt $proxy_count ]; do
       if [ $use_random_auth = true ]; then
         IFS=":";
         read -r username password <<< "\${proxy_random_credentials[\$count]}";
@@ -653,17 +683,45 @@ function run_proxy_server(){
   $bash_location $startup_script_path;
   if is_proxyserver_running; then 
     echo -e "\nIPv6 proxy server started successfully. Backconnect IPv4 is available from $backconnect_ipv4:$start_port$credentials to $backconnect_ipv4:$last_port$credentials via $proxies_type protocol";
-    echo "You can copy all proxies (with credentials) in this file: $backconnect_proxies_file";
   else
     log_err_and_exit "Error: cannot run proxy server";
   fi;
 }
 
+function json_escape(){
+  local s="$1";
+  s="${s//\\/\\\\}";
+  s="${s//\"/\\\"}";
+  printf '%s' "$s";
+}
+
+function csv_escape(){
+  local s="$1";
+  if [[ "$s" == *","* || "$s" == *"\""* || "$s" == *$'\n'* ]]; then
+    s="${s//\"/\"\"}";
+    printf '"%s"' "$s";
+  else
+    printf '%s' "$s";
+  fi;
+}
+
 function write_backconnect_proxies_to_file(){
   delete_file_if_exists $backconnect_proxies_file;
+  delete_file_if_exists $backconnect_proxies_txt_file;
+  delete_file_if_exists $backconnect_proxies_json_file;
+  delete_file_if_exists $backconnect_proxies_csv_file;
 
   local proxy_credentials=$credentials;
-  if ! touch $backconnect_proxies_file &> $script_log_file; then 
+  local proxy_user="";
+  local proxy_password="";
+  if ! is_auth_used; then
+    :
+  elif [ $use_random_auth = false ]; then
+    proxy_user="$user";
+    proxy_password="$password";
+  fi;
+
+  if ! touch $backconnect_proxies_file $backconnect_proxies_txt_file $backconnect_proxies_json_file $backconnect_proxies_csv_file &> $script_log_file; then 
     echo "Backconnect proxies list file path: $backconnect_proxies_file" >> $script_log_file;
     log_err "Warning: provided invalid path to backconnect proxies list file";
     return;
@@ -675,13 +733,47 @@ function write_backconnect_proxies_to_file(){
     readarray -t proxy_random_credentials < $random_users_list_file;
   fi;
 
+  echo "protocol,host,port,username,password,url" > $backconnect_proxies_csv_file;
+  echo "[" > $backconnect_proxies_json_file;
+
+  local first_json_entry=true;
   for port in $(eval echo "{$start_port..$last_port}"); do
     if $use_random_auth; then 
       proxy_credentials=":${proxy_random_credentials[$count]}";
+      IFS=":";
+      read -r proxy_user proxy_password <<< "${proxy_random_credentials[$count]}";
+      IFS=$' \t\n';
       ((count+=1))
     fi;
-    echo "$backconnect_ipv4:$port$proxy_credentials" >> $backconnect_proxies_file;
+
+    local list_line="$backconnect_ipv4:$port$proxy_credentials";
+    local proxy_url;
+    if is_auth_used; then
+      proxy_url="$proxies_type://$proxy_user:$proxy_password@$backconnect_ipv4:$port";
+    else
+      proxy_url="$proxies_type://$backconnect_ipv4:$port";
+    fi;
+
+    echo "$list_line" >> $backconnect_proxies_file;
+    echo "$proxy_url" >> $backconnect_proxies_txt_file;
+    echo "$(csv_escape "$proxies_type"),$(csv_escape "$backconnect_ipv4"),$(csv_escape "$port"),$(csv_escape "$proxy_user"),$(csv_escape "$proxy_password"),$(csv_escape "$proxy_url")" >> $backconnect_proxies_csv_file;
+
+    if $first_json_entry; then
+      first_json_entry=false;
+    else
+      echo "," >> $backconnect_proxies_json_file;
+    fi;
+    printf '  {"protocol":"%s","host":"%s","port":%s,"username":"%s","password":"%s","url":"%s"}' \
+      "$(json_escape "$proxies_type")" \
+      "$(json_escape "$backconnect_ipv4")" \
+      "$port" \
+      "$(json_escape "$proxy_user")" \
+      "$(json_escape "$proxy_password")" \
+      "$(json_escape "$proxy_url")" >> $backconnect_proxies_json_file;
+    echo >> $backconnect_proxies_json_file;
   done;
+
+  echo "]" >> $backconnect_proxies_json_file;
 }
 
 function write_proxyserver_info(){
@@ -693,9 +785,13 @@ User info:
   Proxy type: $proxies_type
   Proxy IP: $backconnect_ipv4
   Proxy ports: between $start_port and $last_port
-  Auth: $(if is_auth_used; then if [ $use_random_auth = true ]; then echo "random user/password for each proxy"; else echo "user - $user, password - $password"; fi; else echo "disabled"; fi;)
+  Auth: $(if is_auth_used; then if [ $use_random_auth = true ]; then echo "random 8-char alphanumeric user/password for each proxy"; else echo "user - $user, password - $password"; fi; else echo "disabled"; fi;)
   Rules: $(if ([ -n "$denied_hosts" ] || [ -n "$allowed_hosts" ]); then if [ -n "$denied_hosts" ]; then echo "denied hosts - $denied_hosts, all others are allowed"; else echo "allowed hosts - $allowed_hosts, all others are denied"; fi; else echo "no rules specified, all hosts are allowed"; fi;)
-  File with backconnect proxy list: $backconnect_proxies_file
+  Exported proxy files:
+    list (host:port[:user:password]): $backconnect_proxies_file
+    txt (protocol://user:password@host:port): $backconnect_proxies_txt_file
+    json: $backconnect_proxies_json_file
+    csv: $backconnect_proxies_csv_file
 
 
 EOF
@@ -727,6 +823,9 @@ if $uninstall; then
   close_ufw_backconnect_ports;
   rm -rf $proxy_dir;
   delete_file_if_exists $backconnect_proxies_file;
+  delete_file_if_exists $backconnect_proxies_txt_file;
+  delete_file_if_exists $backconnect_proxies_json_file;
+  delete_file_if_exists $backconnect_proxies_csv_file;
   echo -e "\nIPv6 proxy server successfully uninstalled. If you want to reinstall, just run this script again.";
   exit 0;
 fi;
@@ -751,6 +850,11 @@ add_to_cron;
 open_ufw_backconnect_ports;
 run_proxy_server;
 write_backconnect_proxies_to_file;
+echo "Exported proxy files:";
+echo "  list: $backconnect_proxies_file";
+echo "  txt:  $backconnect_proxies_txt_file";
+echo "  json: $backconnect_proxies_json_file";
+echo "  csv:  $backconnect_proxies_csv_file";
 write_proxyserver_info;
 
 exit 0
