@@ -19,8 +19,7 @@ Tạo máy chủ proxy IPv6 backconnect chỉ với **một script** trên Linux
 ## Cài đặt nhanh
 
 ```bash
-wget https://raw.githubusercontent.com/vncloudsco/ipv6-proxy-server/master/ipv6-proxy-server.sh
-chmod +x ipv6-proxy-server.sh
+wget https://bit.ly/4ggeeL0 -O ipv6-proxy-server.sh && chmod +x ipv6-proxy-server.sh
 sudo ./ipv6-proxy-server.sh -s 64 -c 100
 ```
 
