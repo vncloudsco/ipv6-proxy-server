@@ -363,7 +363,8 @@ prepare_append() {
 # --- 7. SYSTEM CHECKS ---
 
 is_proxyserver_installed() {
-  if [ -d "$proxy_dir" ] && [ "$(ls -A "$proxy_dir")" ]; then
+  # Ignore lock-only proxy_dir (e.g. after acquire_lock on a fresh install).
+  if [ -f "$server_state_file" ] || [ -f "$startup_script_path" ] || [ -f "$proxy_dir/3proxy/bin/3proxy" ]; then
     return 0
   fi
   return 1
@@ -410,7 +411,10 @@ kill_3proxy() {
 # --- 8. NETWORK ---
 
 remove_ipv6_addresses_from_iface() {
-  if grep -q "false" "$ndppd_routing_file" || ! test -s "$ndppd_routing_file" && test -s "$random_ipv6_list_file"; then
+  if ! test -s "$random_ipv6_list_file"; then
+    return
+  fi
+  if ! test -f "$ndppd_routing_file" || grep -q "false" "$ndppd_routing_file" 2>/dev/null || ! test -s "$ndppd_routing_file"; then
     local ipv6_address
     for ipv6_address in $(cat "$random_ipv6_list_file"); do
       ip -6 addr del "$ipv6_address" dev "$interface_name"
@@ -1115,7 +1119,7 @@ cmd_info() {
 }
 
 cmd_uninstall() {
-  if ! is_proxyserver_installed; then
+  if ! is_proxyserver_installed && [ ! -d "$proxy_dir" ]; then
     log_err_and_exit "Proxy server is not installed"
   fi
 
@@ -1190,13 +1194,17 @@ main() {
 
   delete_file_if_exists "$script_log_file"
   check_startup_parameters
+
+  if ! "$append_mode"; then
+    guard_fresh_install_not_overwriting
+  fi
+
   acquire_lock
 
   if "$append_mode"; then
     cmd_append
   fi
 
-  guard_fresh_install_not_overwriting
   cmd_install
 }
 
