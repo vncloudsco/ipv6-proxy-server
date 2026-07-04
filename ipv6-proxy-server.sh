@@ -28,11 +28,12 @@ function usage() { echo "Usage: $0 [-s | --subnet <16|32|48|64|80|96|112> proxy 
                           [--allowed-hosts <string> allowed hosts or IPs (3proxy format), for example "google.com,*.google.com,*.gstatic.com"
                                 if at least one host is allowed, the rest are banned by default]
                           [--denied-hosts <string> banned hosts or IP addresses in quotes (3proxy format)]
+                          [--append <bool> add more proxies to existing server without changing old config]
                           [--uninstall <bool> disable active proxies, uninstall server and clear all metadata]
                           [--info <bool> print info about running proxy server]
                           " 1>&2; exit 1; }
 
-options=$(getopt -o lhs:c:u:p:t:r:m:f:i:b: --long help,rotate-every-request,localhost,random,no-auth,uninstall,info,subnet:,proxy-count:,username:,password:,proxies-type:,rotating-interval:,ipv6-mask:,interface:,start-port:,backconnect-proxies-file:,backconnect-ip:,allowed-hosts:,denied-hosts: -- "$@")
+options=$(getopt -o lhs:c:u:p:t:r:m:f:i:b: --long help,rotate-every-request,localhost,random,no-auth,append,uninstall,info,subnet:,proxy-count:,username:,password:,proxies-type:,rotating-interval:,ipv6-mask:,interface:,start-port:,backconnect-proxies-file:,backconnect-ip:,allowed-hosts:,denied-hosts: -- "$@")
 
 # Throw error and chow help message if user don`t provide any arguments
 if [ $? != 0 ] ; then echo "Error: no arguments provided. Terminating..." >&2 ; usage ; fi;
@@ -49,11 +50,13 @@ use_localhost=false
 use_random_auth=true
 use_no_auth=false
 random_flag_set=false
+append_mode=false
 uninstall=false
 try_rotate_every_request=false
 rotate_every_request=false
 print_info=false
 backconnect_proxies_file="default"
+add_proxy_count=""
 # Global network inteface name
 interface_name="$(ip -br l | awk '$1 !~ "lo|vir|wl|@NONE" { print $1 }' | awk 'NR==1')"
 # Log file for script execution
@@ -82,6 +85,7 @@ while true; do
     --start-port ) start_port="$2"; shift 2;;
     --random ) use_random_auth=true; random_flag_set=true; shift ;;
     --no-auth ) use_no_auth=true; use_random_auth=false; shift ;;
+    --append ) append_mode=true; shift ;;
     --rotate-every-request ) try_rotate_every_request=true; shift ;;
     -- ) shift; break ;;
     * ) break ;;
@@ -114,8 +118,24 @@ function is_auth_used(){
 function check_startup_parameters(){
   # Check validity of user provided arguments
   re='^[0-9]+$'
-  if ! [[ $proxy_count =~ $re ]] ; then
+  if ! [[ $proxy_count =~ $re ]] || [ "$proxy_count" -le 0 ]; then
     log_err_print_usage_and_exit "Error: Argument -c (proxy count) must be a positive integer number";
+  fi;
+
+  if $append_mode && $uninstall; then
+    log_err_print_usage_and_exit "Error: don't use '--append' together with '--uninstall'";
+  fi;
+
+  if $append_mode && $print_info; then
+    log_err_print_usage_and_exit "Error: don't use '--append' together with '--info'";
+  fi;
+
+  # Append keeps existing config: only -c (count to add) is allowed besides --append
+  if $append_mode; then
+    if $random_flag_set || $use_no_auth || [[ -n "$user" ]] || [[ -n "$password" ]]; then
+      log_err_print_usage_and_exit "Error: with '--append' do not pass auth options (-u/-p/--random/--no-auth); existing auth is preserved";
+    fi;
+    return;
   fi;
 
   if $use_no_auth && $random_flag_set; then
@@ -146,8 +166,8 @@ function check_startup_parameters(){
     log_err_print_usage_and_exit "Error: invalid value of '-r' (proxy external ip rotating interval) parameter";
   fi;
 
-  if [ $start_port -lt 5000 ] || (($start_port - $proxy_count > 65536 )); then
-    log_err_print_usage_and_exit "Wrong '--start-port' parameter value, it must be more than 5000 and '--start-port' + '--proxy-count' must be lower than 65536,
+  if [ $start_port -lt 5000 ] || (( start_port + proxy_count - 1 > 65535 )); then
+    log_err_print_usage_and_exit "Wrong '--start-port' parameter value, it must be more than 5000 and '--start-port' + '--proxy-count' - 1 must be lower than 65536,
   because Linux has only 65536 potentially ports";
   fi;
 
@@ -163,6 +183,12 @@ function check_startup_parameters(){
 
   if cat /sys/class/net/$interface_name/operstate 2>&1 | grep -q "No such file or directory"; then
     log_err_print_usage_and_exit "Incorrect ethernet interface name \"$interface_name\", provide correct name using parameter '--interface'";
+  fi;
+}
+
+function check_port_range(){
+  if [ "$start_port" -lt 5000 ] || (( start_port + proxy_count - 1 > 65535 )); then
+    log_err_and_exit "Error: port range $start_port-$((start_port + proxy_count - 1)) is invalid (need start-port >= 5000 and last port <= 65535)";
   fi;
 }
 
@@ -196,14 +222,112 @@ backconnect_proxies_file="$backconnect_proxies_base.list";
 backconnect_proxies_txt_file="$backconnect_proxies_base.txt";
 backconnect_proxies_json_file="$backconnect_proxies_base.json";
 backconnect_proxies_csv_file="$backconnect_proxies_base.csv";
+# Persisted server state (used by --append / --info)
+server_state_file="$proxy_dir/server.state"
+# Exclusive lock to prevent concurrent install/append/uninstall
+lock_file="$proxy_dir/.lock"
 # Script on server startup (generate random ids and run proxy daemon)
 startup_script_path="$proxy_dir/proxy-startup.sh"
 # Cron config path (start proxy server after linux reboot and IPs rotations)
 cron_script_path="$proxy_dir/proxy-server.cron"
-# Last opened port for backconnect proxy
-last_port=$(($start_port + $proxy_count - 1));
+# Last opened port for backconnect proxy (recomputed after append/load state)
+last_port=""
 # Proxy credentials - username and password, delimited by ':', if exist, or empty string, if auth == false
-credentials=$(is_auth_used && [[ $use_random_auth == false ]] && echo -n ":$user:$password" || echo -n "");
+credentials=""
+
+function refresh_derived_values(){
+  last_port=$((start_port + proxy_count - 1));
+  credentials=$(is_auth_used && [[ $use_random_auth == false ]] && echo -n ":$user:$password" || echo -n "");
+}
+
+function acquire_lock(){
+  mkdir -p "$proxy_dir";
+  exec 9>"$lock_file";
+  if ! flock -n 9; then
+    log_err_and_exit "Error: another ipv6-proxy-server operation is in progress (lock: $lock_file). Wait for it to finish.";
+  fi;
+}
+
+function save_server_state(){
+  cat > "$server_state_file" <<-EOF
+proxy_count=$(printf '%q' "$proxy_count")
+start_port=$(printf '%q' "$start_port")
+last_port=$(printf '%q' "$last_port")
+proxies_type=$(printf '%q' "$proxies_type")
+use_random_auth=$(printf '%q' "$use_random_auth")
+use_no_auth=$(printf '%q' "$use_no_auth")
+user=$(printf '%q' "$user")
+password=$(printf '%q' "$password")
+subnet=$(printf '%q' "$subnet")
+subnet_mask=$(printf '%q' "$subnet_mask")
+backconnect_ipv4=$(printf '%q' "$backconnect_ipv4")
+interface_name=$(printf '%q' "$interface_name")
+rotating_interval=$(printf '%q' "$rotating_interval")
+rotate_every_request=$(printf '%q' "$rotate_every_request")
+try_rotate_every_request=$(printf '%q' "$try_rotate_every_request")
+allowed_hosts=$(printf '%q' "$allowed_hosts")
+denied_hosts=$(printf '%q' "$denied_hosts")
+use_localhost=$(printf '%q' "$use_localhost")
+backconnect_proxies_base=$(printf '%q' "$backconnect_proxies_base")
+EOF
+}
+
+function apply_export_paths_from_base(){
+  backconnect_proxies_file="$backconnect_proxies_base.list";
+  backconnect_proxies_txt_file="$backconnect_proxies_base.txt";
+  backconnect_proxies_json_file="$backconnect_proxies_base.json";
+  backconnect_proxies_csv_file="$backconnect_proxies_base.csv";
+}
+
+function load_server_state(){
+  if [ ! -f "$server_state_file" ]; then
+    log_err_and_exit "Error: server state file not found ($server_state_file). Cannot append. Reinstall once, or use --uninstall then install again.";
+  fi;
+  # shellcheck disable=SC1090
+  source "$server_state_file";
+  apply_export_paths_from_base;
+  refresh_derived_values;
+}
+
+function verify_state_consistency(){
+  if $use_random_auth; then
+    if [ ! -f "$random_users_list_file" ]; then
+      log_err_and_exit "Error: random users file missing ($random_users_list_file). State is inconsistent; use --uninstall and reinstall.";
+    fi;
+    local users_lines;
+    users_lines=$(wc -l < "$random_users_list_file" | tr -d ' ');
+    if [ "$users_lines" -ne "$proxy_count" ]; then
+      log_err_and_exit "Error: random users count ($users_lines) does not match proxy_count ($proxy_count). Use --uninstall and reinstall.";
+    fi;
+  fi;
+
+  if [ -f "$backconnect_proxies_file" ]; then
+    local list_lines;
+    list_lines=$(wc -l < "$backconnect_proxies_file" | tr -d ' ');
+    if [ "$list_lines" -ne "$proxy_count" ]; then
+      log_err_and_exit "Error: proxy list lines ($list_lines) does not match proxy_count ($proxy_count). Use --uninstall and reinstall.";
+    fi;
+  fi;
+}
+
+function prepare_append(){
+  if ! is_proxyserver_installed; then
+    log_err_and_exit "Error: proxy server is not installed. Install first, then use --append.";
+  fi;
+
+  add_proxy_count="$proxy_count";
+  load_server_state;
+  verify_state_consistency;
+
+  local old_proxy_count=$proxy_count;
+  local old_last_port=$last_port;
+  proxy_count=$((old_proxy_count + add_proxy_count));
+  check_port_range;
+  refresh_derived_values;
+
+  echo -e "Appending $add_proxy_count proxies to existing pool ($old_proxy_count -> $proxy_count)";
+  echo "Existing ports $start_port-$old_last_port kept; new ports $((old_last_port + 1))-$last_port";
+}
 
 function is_proxyserver_installed(){
   if [ -d $proxy_dir ] && [ "$(ls -A $proxy_dir)" ]; then return 0; fi;
@@ -468,6 +592,17 @@ function generate_random_users_if_needed(){
   delete_file_if_exists $random_users_list_file;
   
   for i in $(seq 1 $proxy_count); do 
+    echo $(create_random_string 8):$(create_random_string 8) >> $random_users_list_file;
+  done;
+}
+
+function append_random_users_if_needed(){
+  # Only add credentials for new proxies; keep existing user/pass lines untouched
+  if ! $use_random_auth; then
+    return;
+  fi;
+  local i;
+  for i in $(seq 1 $add_proxy_count); do
     echo $(create_random_string 8):$(create_random_string 8) >> $random_users_list_file;
   done;
 }
@@ -792,6 +927,7 @@ User info:
     txt (protocol://user:password@host:port): $backconnect_proxies_txt_file
     json: $backconnect_proxies_json_file
     csv: $backconnect_proxies_csv_file
+  State file: $server_state_file
 
 
 EOF
@@ -805,6 +941,26 @@ Technical info:
 EOF
 }
 
+function apply_proxy_configuration(){
+  if $append_mode; then
+    append_random_users_if_needed;
+  else
+    generate_random_users_if_needed;
+  fi;
+  create_startup_script;
+  add_to_cron;
+  open_ufw_backconnect_ports;
+  run_proxy_server;
+  write_backconnect_proxies_to_file;
+  echo "Exported proxy files:";
+  echo "  list: $backconnect_proxies_file";
+  echo "  txt:  $backconnect_proxies_txt_file";
+  echo "  json: $backconnect_proxies_json_file";
+  echo "  csv:  $backconnect_proxies_csv_file";
+  write_proxyserver_info;
+  save_server_state;
+}
+
 if $print_info; then
   if ! is_proxyserver_installed; then log_err_and_exit "Proxy server isn't installed"; fi;
   if ! is_proxyserver_running; then log_err_and_exit "Proxy server isn't running. You can check log of previous run attempt in $script_log_file"; fi;
@@ -816,7 +972,15 @@ fi;
 
 if $uninstall; then
   if ! is_proxyserver_installed; then log_err_and_exit "Proxy server is not installed"; fi;
-  
+
+  acquire_lock;
+  # Load export paths from state when available so custom -f outputs are removed too
+  if [ -f "$server_state_file" ]; then
+    # shellcheck disable=SC1090
+    source "$server_state_file";
+    apply_export_paths_from_base;
+  fi;
+
   remove_from_cron;
   kill_3proxy;
   remove_ipv6_addresses_from_iface;
@@ -833,28 +997,36 @@ fi;
 
 delete_file_if_exists $script_log_file;
 check_startup_parameters;
+acquire_lock;
+
+if $append_mode; then
+  prepare_append;
+  apply_proxy_configuration;
+  echo -e "\nAppend completed successfully. Total proxies: $proxy_count (ports $start_port-$last_port)";
+  exit 0;
+fi;
+
+# Fresh install only — refuse to overwrite an existing pool (use --append or --uninstall)
+if is_proxyserver_installed; then
+  local_existing_count="unknown";
+  if [ -f "$server_state_file" ]; then
+    # shellcheck disable=SC1090
+    source "$server_state_file";
+    local_existing_count="$proxy_count";
+  elif [ -f "$backconnect_proxies_file" ]; then
+    local_existing_count=$(wc -l < "$backconnect_proxies_file" | tr -d ' ');
+  fi;
+  log_err_and_exit "Error: proxy server already installed ($local_existing_count proxies). Use '--append -c <N>' to add more proxies without changing existing ones, or '--uninstall' to remove everything first.";
+fi;
+
 check_ipv6;
 backconnect_ipv4=$(get_backconnect_ipv4);
-subnet_mask=$(get_subnet_mask)
-if is_proxyserver_installed; then
-  echo -e "Proxy server already installed, reconfiguring:\n";
-else
-  configure_ipv6;
-  install_requred_packages;
-  install_3proxy;
-  configure_ndppd;
-fi;
-generate_random_users_if_needed;
-create_startup_script;
-add_to_cron;
-open_ufw_backconnect_ports;
-run_proxy_server;
-write_backconnect_proxies_to_file;
-echo "Exported proxy files:";
-echo "  list: $backconnect_proxies_file";
-echo "  txt:  $backconnect_proxies_txt_file";
-echo "  json: $backconnect_proxies_json_file";
-echo "  csv:  $backconnect_proxies_csv_file";
-write_proxyserver_info;
+subnet_mask=$(get_subnet_mask);
+refresh_derived_values;
+configure_ipv6;
+install_requred_packages;
+install_3proxy;
+configure_ndppd;
+apply_proxy_configuration;
 
 exit 0
