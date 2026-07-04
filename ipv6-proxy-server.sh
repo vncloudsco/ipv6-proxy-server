@@ -244,6 +244,22 @@ list_install_blockers() {
   printf '%b' "$blockers"
 }
 
+remove_invalid_proxy_path() {
+  local dir=$1
+  if [ -e "$dir" ] && [ ! -d "$dir" ]; then
+    echo "Removing invalid path (not a directory): $dir"
+    rm -f "$dir"
+  fi
+}
+
+ensure_proxy_dir() {
+  local dir=$1
+  remove_invalid_proxy_path "$dir"
+  if ! mkdir -p "$dir"; then
+    log_err_and_exit "Error: cannot create directory $dir. Remove or rename the existing file at that path and retry."
+  fi
+}
+
 refresh_derived_values() {
   last_port=$((start_port + proxy_count - 1))
   credentials=$(is_auth_used && [[ "$use_random_auth" == false ]] && echo -n ":$user:$password" || echo -n "")
@@ -348,7 +364,7 @@ check_startup_parameters() {
 # --- 6. STATE & LOCK ---
 
 acquire_lock() {
-  mkdir -p "$proxy_dir"
+  ensure_proxy_dir "$proxy_dir"
   exec 9>"$lock_file"
   if ! flock -n 9; then
     log_err_and_exit "Error: another ipv6-proxy-server operation is in progress (lock: $lock_file). Wait for it to finish."
@@ -603,9 +619,7 @@ check_ipv6() {
   local ifaces_config="/etc/network/interfaces"
   if [ ! -f "$ifaces_config" ]; then
     log_err "Potential error: interfaces config ($ifaces_config) doesn't exist"
-  fi
-
-  if grep 'inet6' "$ifaces_config" > /dev/null; then
+  elif grep 'inet6' "$ifaces_config" > /dev/null; then
     echo "Network interfaces for IPv6 configured correctly"
   else
     log_err "Potential error: $ifaces_config has no inet6 (IPv6) configuration."
@@ -709,10 +723,12 @@ install_required_packages() {
 }
 
 install_3proxy() {
-  mkdir "$proxy_dir" && cd "$proxy_dir"
+  ensure_proxy_dir "$proxy_dir"
+  cd "$proxy_dir" || log_err_and_exit "Error: cannot enter directory $proxy_dir"
 
   echo -e "\nDownloading proxy server source..."
   (
+    cd "$proxy_dir" || exit 1
     wget "https://github.com/3proxy/3proxy/archive/refs/tags/${PROXY_3PROXY_VERSION}.tar.gz" &> /dev/null
     tar -xf "${PROXY_3PROXY_VERSION}.tar.gz"
     rm "${PROXY_3PROXY_VERSION}.tar.gz"
@@ -721,14 +737,14 @@ install_3proxy() {
   echo "Proxy server source code downloaded successfully"
 
   echo -e "\nStart building proxy server execution file from source..."
-  cd 3proxy
+  cd "$proxy_dir/3proxy" || log_err_and_exit "Error: 3proxy source directory missing after download (see $script_log_file)"
   make -f Makefile.Linux &>> "$script_log_file"
   if test -f "$proxy_dir/3proxy/bin/3proxy"; then
     echo "Proxy server builded successfully"
   else
-    log_err_and_exit "Error: proxy server build from source code failed."
+    log_err_and_exit "Error: proxy server build from source code failed. See $script_log_file for details."
   fi
-  cd ..
+  cd "$proxy_dir" || exit 1
 }
 
 # --- 10. PROXY RUNTIME ---
@@ -1224,6 +1240,9 @@ cmd_info() {
 has_install_artifacts() {
   local dir
   for dir in $(list_proxy_dir_candidates); do
+    if [ -e "$dir" ] && [ ! -d "$dir" ]; then
+      return 0
+    fi
     if proxy_dir_has_install_marker "$dir" || [ -d "$dir" ]; then
       return 0
     fi
@@ -1247,6 +1266,7 @@ cmd_uninstall() {
 
   local dir
   for dir in $(list_proxy_dir_candidates); do
+    remove_invalid_proxy_path "$dir"
     if [ -d "$dir" ] || proxy_dir_has_install_marker "$dir"; then
       cleanup_proxy_dir "$dir"
     fi
@@ -1289,6 +1309,11 @@ ${blockers}Use '--uninstall' to remove everything first, or '--append -c <N>' to
 }
 
 cmd_install() {
+  local dir
+  for dir in $(list_proxy_dir_candidates); do
+    remove_invalid_proxy_path "$dir"
+  done
+
   check_ipv6
   backconnect_ipv4=$(get_backconnect_ipv4)
   subnet_mask=$(get_subnet_mask)
