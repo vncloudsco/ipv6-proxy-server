@@ -366,9 +366,31 @@ check_startup_parameters() {
 acquire_lock() {
   ensure_proxy_dir "$proxy_dir"
   exec 9>"$lock_file"
-  if ! flock -n 9; then
+  if flock -n 9; then
+    return 0
+  fi
+  exec 9>&-
+
+  if pgrep -f '[i]pv6-proxy-server\.sh' | grep -qv "$$"; then
     log_err_and_exit "Error: another ipv6-proxy-server operation is in progress (lock: $lock_file). Wait for it to finish."
   fi
+
+  # 3proxy may inherit fd 9 from an older install run; stop it and retry once.
+  kill_3proxy
+  sleep 1
+
+  exec 9>"$lock_file"
+  if flock -n 9; then
+    return 0
+  fi
+  exec 9>&-
+  rm -f "$lock_file"
+  exec 9>"$lock_file"
+  flock -n 9 || log_err_and_exit "Error: cannot acquire lock ($lock_file)."
+}
+
+release_lock() {
+  exec 9>&-
 }
 
 save_server_state() {
@@ -1029,6 +1051,9 @@ run_proxy_server() {
     log_err_and_exit "Error: proxy startup script doesn't exist."
   fi
 
+  # Release before spawning startup/3proxy so the daemon does not inherit flock fd 9.
+  release_lock
+
   chmod +x "$startup_script_path"
   "$bash_location" "$startup_script_path"
   if is_proxyserver_running; then
@@ -1209,15 +1234,15 @@ apply_proxy_configuration() {
   create_startup_script
   add_to_cron
   open_ufw_backconnect_ports
-  run_proxy_server
   write_backconnect_proxies_to_file
+  write_proxyserver_info
+  save_server_state
+  run_proxy_server
   echo "Exported proxy files:"
   echo "  list: $backconnect_proxies_file"
   echo "  txt:  $backconnect_proxies_txt_file"
   echo "  json: $backconnect_proxies_json_file"
   echo "  csv:  $backconnect_proxies_csv_file"
-  write_proxyserver_info
-  save_server_state
 }
 
 # --- 11. MAIN ---
@@ -1259,10 +1284,11 @@ cmd_uninstall() {
   fi
 
   set_paths_for_proxy_dir "$(get_user_home_dir)/proxyserver"
-  acquire_lock
 
   remove_from_cron
   kill_3proxy
+  sleep 1
+  acquire_lock
 
   local dir
   for dir in $(list_proxy_dir_candidates); do
